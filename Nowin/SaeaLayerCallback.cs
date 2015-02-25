@@ -15,15 +15,16 @@ namespace Nowin
             Receive = 1,
             Send = 2,
             Disconnect = 4,
-            Aborting = 8
+            Aborting = 8,
+            DelayedAccept = 16
         }
         readonly ITransportLayerHandler _handler;
         readonly Socket _listenSocket;
         readonly Server _server;
         readonly int _handlerId;
-        readonly SocketAsyncEventArgs _receiveEvent = new SocketAsyncEventArgs();
-        readonly SocketAsyncEventArgs _sendEvent = new SocketAsyncEventArgs();
-        readonly SocketAsyncEventArgs _disconnectEvent = new SocketAsyncEventArgs();
+        SocketAsyncEventArgs _receiveEvent;
+        SocketAsyncEventArgs _sendEvent;
+        SocketAsyncEventArgs _disconnectEvent;
         Socket _socket;
 #pragma warning disable 420
         volatile int _state;
@@ -34,6 +35,15 @@ namespace Nowin
             _listenSocket = listenSocket;
             _server = server;
             _handlerId = handlerId;
+            RecreateSaeas();
+            handler.Callback = this;
+        }
+
+        void RecreateSaeas()
+        {
+            _receiveEvent = new SocketAsyncEventArgs();
+            _sendEvent = new SocketAsyncEventArgs();
+            _disconnectEvent = new SocketAsyncEventArgs();
             _receiveEvent.Completed += IoCompleted;
             _sendEvent.Completed += IoCompleted;
             _disconnectEvent.Completed += IoCompleted;
@@ -43,7 +53,6 @@ namespace Nowin
             _receiveEvent.UserToken = this;
             _sendEvent.UserToken = this;
             _disconnectEvent.UserToken = this;
-            handler.Callback = this;
         }
 
         static void IoCompleted(object sender, SocketAsyncEventArgs e)
@@ -85,16 +94,26 @@ namespace Nowin
                 oldState = _state;
                 newState = oldState & ~(int)State.Receive;
             } while (Interlocked.CompareExchange(ref _state, newState, oldState) != oldState);
-            _server.ReportNewConnectedClient();
-            _socket = _receiveEvent.AcceptSocket;
-            if (_receiveEvent.BytesTransferred >= 0 && _receiveEvent.SocketError == SocketError.Success)
+            var bytesTransfered = _receiveEvent.BytesTransferred;
+            var socketError = _receiveEvent.SocketError;
+            if (bytesTransfered >= 0 && socketError == SocketError.Success)
             {
-                _handler.FinishAccept(_receiveEvent.Buffer, _receiveEvent.Offset, _receiveEvent.BytesTransferred, _socket.RemoteEndPoint as IPEndPoint, _socket.LocalEndPoint as IPEndPoint);
+                _socket = _receiveEvent.AcceptSocket;
+                _server.ReportNewConnectedClient();
+                _handler.FinishAccept(_receiveEvent.Buffer, _receiveEvent.Offset, bytesTransfered,
+                    _socket.RemoteEndPoint as IPEndPoint, _socket.LocalEndPoint as IPEndPoint);
+            }
+            else
+            {
+                // Current socket could be corrupted Windows returns InvalidArguments nonsense.
+                RecreateSaeas();
+                _handler.PrepareAccept();
             }
         }
 
         void ProcessReceive()
         {
+            bool postponedAccept;
             var bytesTransferred = _receiveEvent.BytesTransferred;
             if (bytesTransferred > 0 && _receiveEvent.SocketError == SocketError.Success)
             {
@@ -102,7 +121,9 @@ namespace Nowin
                 do
                 {
                     oldState = _state;
-                    newState = oldState & ~(int)State.Receive;
+                    postponedAccept = (oldState & (int)State.DelayedAccept) != 0;
+                    newState = oldState & ~(int)(State.Receive | State.DelayedAccept);
+
                 } while (Interlocked.CompareExchange(ref _state, newState, oldState) != oldState);
                 _handler.FinishReceive(_receiveEvent.Buffer, _receiveEvent.Offset, bytesTransferred);
             }
@@ -112,10 +133,12 @@ namespace Nowin
                 do
                 {
                     oldState = _state;
-                    newState = (oldState & ~(int)State.Receive) | (int)State.Aborting;
+                    postponedAccept = (oldState & (int)State.DelayedAccept) != 0;
+                    newState = (oldState & ~(int)(State.Receive | State.DelayedAccept));
                 } while (Interlocked.CompareExchange(ref _state, newState, oldState) != oldState);
                 _handler.FinishReceive(null, 0, -1);
             }
+            if (postponedAccept) _handler.PrepareAccept();
         }
 
         void ProcessSend()
@@ -136,15 +159,18 @@ namespace Nowin
 
         void ProcessDisconnect()
         {
+            bool delayedAccept;
             int oldState, newState;
             do
             {
                 oldState = _state;
-                newState = (oldState & ~(int)(State.Disconnect | State.Aborting));
+                delayedAccept = (oldState & (int) State.Receive) != 0;
+                newState = (oldState & ~(int)(State.Disconnect | State.Aborting)) | (delayedAccept ? (int)State.DelayedAccept : 0);
             } while (Interlocked.CompareExchange(ref _state, newState, oldState) != oldState);
             _socket = null;
             _server.ReportDisconnectedClient();
-            _handler.PrepareAccept();
+            if (!delayedAccept)
+                _handler.PrepareAccept();
         }
 
         public void StartAccept(byte[] buffer, int offset, int length)
@@ -156,7 +182,7 @@ namespace Nowin
                 oldState = _state;
                 if ((oldState & (int)State.Receive) != 0)
                     throw new InvalidOperationException("Already receiving or accepting");
-                newState = oldState | (int)State.Receive;
+                newState = oldState | (int)State.Receive & ~(int)State.Aborting;
             } while (Interlocked.CompareExchange(ref _state, newState, oldState) != oldState);
             _receiveEvent.SetBuffer(buffer, offset, length);
             bool willRaiseEvent;
