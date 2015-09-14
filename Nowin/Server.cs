@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Concurrent;
 using System.Net.Sockets;
 using System.Text;
@@ -9,7 +10,6 @@ namespace Nowin
     public class Server : INowinServer
     {
         internal static readonly byte[] Status100Continue = Encoding.UTF8.GetBytes("HTTP/1.1 100 Continue\r\n\r\n");
-        internal static readonly byte[] Status500InternalServerError = Encoding.UTF8.GetBytes("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\n\r\n");
 
         readonly IServerParameters _parameters;
 
@@ -58,10 +58,23 @@ namespace Nowin
             _layerFactory = new Transport2HttpFactory(_parameters.BufferSize, isSsl, _parameters.ServerHeader, _ipIsLocalChecker, _layerFactory);
             if (isSsl)
             {
-                _layerFactory = new SslTransportFactory(_parameters.Certificate, _layerFactory);
+                _layerFactory = new SslTransportFactory(_parameters.Certificate, _parameters.Protocols, _layerFactory);
             }
             ListenSocket = new Socket(_parameters.EndPoint.AddressFamily, SocketType.Stream, ProtocolType.Tcp);
-            ListenSocket.Bind(_parameters.EndPoint);
+            var start = DateTime.UtcNow;
+            while (true)
+            {
+                try
+                {
+                    ListenSocket.Bind(_parameters.EndPoint);
+                    break;
+                }
+                catch
+                {
+                    if (start + _parameters.RetrySocketBindingTime <= DateTime.UtcNow) throw;
+                }
+                Thread.Sleep(50);
+            }
             ListenSocket.Listen(100);
             var initialConnectionCount = _connectionAllocationStrategy.CalculateNewConnectionCount(0, 0);
             AllocatedConnections = initialConnectionCount;
@@ -78,6 +91,8 @@ namespace Nowin
             get { return AllocatedConnections; }
         }
 
+        public ExecutionContextFlow ContextFlow { get { return _parameters.ContextFlow; } }
+
         public void Dispose()
         {
             lock (_newConnectionLock)
@@ -87,7 +102,7 @@ namespace Nowin
 
             if (ListenSocket != null)
             {
-                ListenSocket.Close();
+                ListenSocket.Dispose();
             }
 
             foreach (var block in _blocks)

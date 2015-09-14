@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Net;
+using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading.Tasks;
 
@@ -11,10 +12,13 @@ namespace Nowin
         IConnectionAllocationStrategy _connectionAllocationStrategy;
         IPEndPoint _endPoint;
         X509Certificate _certificate;
+        SslProtocols _protocols = SslProtocols.Tls | SslProtocols.Tls11 | SslProtocols.Tls12;
         int _bufferSize;
         Func<IDictionary<string, object>, Task> _app;
         IDictionary<string, object> _capabilities;
         string _serverHeader = "Nowin";
+        private ExecutionContextFlow _contextFlow  = ExecutionContextFlow.SuppressAlways;
+        private TimeSpan _retrySocketBindingTime;
 
         public static ServerBuilder New()
         {
@@ -27,6 +31,11 @@ namespace Nowin
             return this;
         }
 
+        public ServerBuilder SetRetrySocketBindingTime(TimeSpan value)
+        {
+            _retrySocketBindingTime = value;
+            return this;
+        }
         public ServerBuilder SetPort(int port)
         {
             if (port < IPEndPoint.MinPort || port > IPEndPoint.MaxPort) throw new ArgumentOutOfRangeException("port", port, "must be in range of <0,65535>");
@@ -59,6 +68,12 @@ namespace Nowin
             return this;
         }
 
+        public ServerBuilder SetProtocols(SslProtocols protocols)
+        {
+            _protocols = protocols;
+            return this;
+        }
+
         public ServerBuilder SetBufferSize(int size)
         {
             if (size < 1024 || size > 65536) throw new ArgumentOutOfRangeException("size", size, "Must be in range <1024,65536>");
@@ -78,6 +93,12 @@ namespace Nowin
             return this;
         }
 
+        public ServerBuilder SetExecutionContextFlow(ExecutionContextFlow flow)
+        {
+            _contextFlow = flow;
+            return this;
+        }
+
         public ServerBuilder SetServerHeader(string value)
         {
             _serverHeader = value;
@@ -94,6 +115,11 @@ namespace Nowin
             var s = new Server(this);
             s.Start();
             return s;
+        }
+
+        public ExecutionContextFlow ContextFlow
+        {
+            get { return _contextFlow; }
         }
 
         IConnectionAllocationStrategy IServerParameters.ConnectionAllocationStrategy
@@ -139,5 +165,21 @@ namespace Nowin
         }
 
         public string ServerHeader { get { return _serverHeader; }}
+
+        public TimeSpan RetrySocketBindingTime
+        {
+            get
+            {
+                return _retrySocketBindingTime;
+            }
+        }
+
+        public SslProtocols Protocols
+        {
+            get
+            {
+                return _protocols;
+            }
+        }
     }
 }

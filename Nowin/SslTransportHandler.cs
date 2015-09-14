@@ -4,6 +4,7 @@ using System.IO;
 using System.Net;
 using System.Net.Security;
 using System.Runtime.ExceptionServices;
+using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
@@ -14,6 +15,7 @@ namespace Nowin
     {
         readonly ITransportLayerHandler _next;
         readonly X509Certificate _serverCertificate;
+        readonly SslProtocols _protocols;
         SslStream _ssl;
         Task _authenticateTask;
         byte[] _recvBuffer;
@@ -23,8 +25,9 @@ namespace Nowin
         IPEndPoint _remoteEndPoint;
         IPEndPoint _localEndPoint;
 
-        public SslTransportHandler(ITransportLayerHandler next, X509Certificate serverCertificate)
+        public SslTransportHandler(ITransportLayerHandler next, X509Certificate serverCertificate, SslProtocols protocols)
         {
+            _protocols = protocols;
             _next = next;
             _serverCertificate = serverCertificate;
             _inputStream = new InputStream(this);
@@ -203,17 +206,17 @@ namespace Nowin
             try
             {
                 _ssl = new SslStream(_inputStream, true);
-                _authenticateTask = _ssl.AuthenticateAsServerAsync(_serverCertificate).ContinueWith((t, selfObject) =>
+                _authenticateTask = _ssl.AuthenticateAsServerAsync(_serverCertificate, false, _protocols, false).ContinueWith((t, selfObject) =>
                 {
                     var self = (SslTransportHandler)selfObject;
                     if (t.IsFaulted || t.IsCanceled)
-                        self._next.FinishAccept(null, 0, 0, null, null);
+                        self.Callback.StartDisconnect();
                     else
                         self._ssl.ReadAsync(self._recvBuffer, self._recvOffset, self._recvLength).ContinueWith((t2, selfObject2) =>
                         {
                             var self2 = (SslTransportHandler)selfObject2;
                             if (t2.IsFaulted || t2.IsCanceled)
-                                self2._next.FinishAccept(null, 0, 0, null, null);
+                                self.Callback.StartDisconnect();
                             else
                                 self2._next.FinishAccept(self2._recvBuffer, self2._recvOffset, t2.Result, self2._remoteEndPoint, self2._localEndPoint);
                         }, self);
@@ -248,19 +251,28 @@ namespace Nowin
             _recvBuffer = buffer;
             _recvOffset = offset;
             _recvLength = length;
-            _ssl.ReadAsync(buffer, offset, length).ContinueWith((t, selfObject) =>
+            try
             {
-                var self = (SslTransportHandler)selfObject;
-                if (t.IsFaulted || t.IsCanceled || t.Result == 0)
-                    self._next.FinishReceive(null, 0, -1);
-                else
-                    self._next.FinishReceive(self._recvBuffer, self._recvOffset, t.Result);
-            }, this);
+                _ssl.ReadAsync(buffer, offset, length).ContinueWith((t, selfObject) =>
+                {
+                    var self = (SslTransportHandler)selfObject;
+                    if (t.IsFaulted || t.IsCanceled || t.Result == 0)
+                        self._next.FinishReceive(null, 0, -1);
+                    else
+                        self._next.FinishReceive(self._recvBuffer, self._recvOffset, t.Result);
+                }, this);
+            }
+            catch (Exception)
+            {
+                _next.FinishReceive(null, 0, -1);
+            }
         }
 
         public void StartSend(byte[] buffer, int offset, int length)
         {
-            _ssl.WriteAsync(buffer, offset, length).ContinueWith((t, selfObject) =>
+            try
+            {
+                _ssl.WriteAsync(buffer, offset, length).ContinueWith((t, selfObject) =>
                 {
                     var self = (SslTransportHandler)selfObject;
                     if (t.IsCanceled)
@@ -276,6 +288,11 @@ namespace Nowin
                         self._next.FinishSend(null);
                     }
                 }, this);
+            }
+            catch (Exception ex)
+            {
+                _next.FinishSend(ex);
+            }
         }
 
         public void StartDisconnect()
